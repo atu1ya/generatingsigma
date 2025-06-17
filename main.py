@@ -1,14 +1,19 @@
 import numpy as np
+from scipy import stats
+from scipy.optimize import minimize
 
 nInst = 50
 max_notional = 10_000
 total_capital = nInst * max_notional
 prev_pos = np.zeros(nInst)
 rolling_sharpe = np.zeros(nInst)
-rolling_returns = np.zeros((nInst, 20))
+rolling_returns = np.zeros((nInst, 100))  # Store much more history
 trade_count = 0
-recent_pnl = np.zeros(10)  # Track recent P&L for drawdown detection
-volatility_regime = "normal"  # Track volatility regime
+recent_pnl = np.zeros(50)  # Track more P&L history
+volatility_regime = "normal"
+return_history = []  # Store all returns for complex analysis
+price_history = []   # Store all prices for complex analysis
+position_history = [] # Store position history
 
 # Black-Scholes inspired volatility estimation
 def estimate_volatility(prices, window=20):
@@ -47,52 +52,205 @@ def ou_mean_reversion_speed(spread, dt=1/252):
     alpha = np.cov(x, y)[0, 1] / (np.var(x) * dt)
     return max(0, alpha)  # Ensure positive mean reversion
 
-# Kelly criterion for position sizing
-def kelly_position_size(expected_return, variance, max_leverage=2.0):
-    """Calculate optimal position size using Kelly criterion"""
-    if variance <= 0:
+# Advanced statistical analysis functions
+def calculate_var_cvar(returns, confidence=0.05):
+    """Calculate Value at Risk and Conditional Value at Risk"""
+    if len(returns) < 10:
+        return 0.0, 0.0
+    
+    sorted_returns = np.sort(returns)
+    var_index = int(confidence * len(sorted_returns))
+    var = sorted_returns[var_index] if var_index < len(sorted_returns) else sorted_returns[-1]
+    cvar = np.mean(sorted_returns[:var_index]) if var_index > 0 else var
+    return var, cvar
+
+def advanced_regime_detection(all_returns, window=50):
+    """Advanced regime detection using multiple statistical measures"""
+    if len(all_returns) < window:
+        return "insufficient_data", 1.0
+    
+    recent_returns = all_returns[-window:]
+    
+    # Multiple statistical measures
+    volatility = np.std(recent_returns) * np.sqrt(252)
+    mean_return = np.mean(recent_returns)
+    
+    # Simple skewness and kurtosis calculations
+    centered_returns = recent_returns - mean_return
+    skewness = np.mean(centered_returns**3) / (np.std(recent_returns)**3 + 1e-8)
+    kurtosis = np.mean(centered_returns**4) / (np.std(recent_returns)**4 + 1e-8) - 3
+    
+    # Autocorrelation
+    if len(recent_returns) > 1:
+        autocorr = np.corrcoef(recent_returns[:-1], recent_returns[1:])[0,1]
+        if np.isnan(autocorr):
+            autocorr = 0
+    else:
+        autocorr = 0
+    
+    # Regime classification with confidence scores
+    if volatility > 0.5 and abs(skewness) > 1.5:
+        return "crisis", 0.1
+    elif volatility > 0.35 and kurtosis > 5:
+        return "high_stress", 0.2
+    elif abs(autocorr) > 0.3 and volatility > 0.25:
+        return "trending_volatile", 0.4
+    elif autocorr > 0.2 and volatility < 0.2:
+        return "trending_stable", 1.2
+    elif volatility > 0.3:
+        return "high_volatility", 0.5
+    elif abs(skewness) > 1.0 or kurtosis > 3:  # Non-normal returns
+        return "anomalous", 0.3
+    else:
+        return "normal", 1.0
+
+def portfolio_optimization(expected_returns, cov_matrix, risk_aversion=1.0):
+    """Mean-variance portfolio optimization"""
+    n = len(expected_returns)
+    if n == 0 or np.any(np.isnan(expected_returns)) or np.any(np.isnan(cov_matrix)):
+        return np.zeros(n)
+    
+    # Add regularization to covariance matrix
+    cov_matrix += np.eye(n) * 1e-6
+    
+    try:
+        # Solve for optimal weights: w = (1/λ) * Σ^(-1) * μ
+        inv_cov = np.linalg.pinv(cov_matrix)
+        optimal_weights = np.dot(inv_cov, expected_returns) / risk_aversion
+        
+        # Normalize weights
+        total_weight = np.sum(np.abs(optimal_weights))
+        if total_weight > 0:
+            optimal_weights = optimal_weights / total_weight
+        
+        return optimal_weights
+    except:
+        return np.zeros(n)
+
+def advanced_momentum_analysis(prices, returns_history):
+    """Comprehensive momentum analysis using multiple timeframes and methods"""
+    if len(prices) < 20 or len(returns_history) < 20:
+        return 0.0, 0.0  # momentum, confidence
+    
+    # Multiple momentum calculations
+    momentum_signals = []
+    
+    # Price momentum (multiple timeframes)
+    for window in [5, 10, 20, 30]:
+        if len(prices) >= window + 1:
+            mom = (prices[-1] - prices[-window-1]) / prices[-window-1]
+            momentum_signals.append(mom)
+    
+    # Return-based momentum
+    if len(returns_history) >= 10:
+        recent_returns = returns_history[-10:]
+        avg_return = np.mean(recent_returns)
+        momentum_signals.append(avg_return * 10)  # Scale up
+    
+    # Trend strength using simple linear regression
+    if len(prices) >= 20:
+        x = np.arange(len(prices[-20:]))
+        y = prices[-20:]
+        
+        # Simple linear regression
+        n = len(x)
+        sum_x = np.sum(x)
+        sum_y = np.sum(y)
+        sum_xy = np.sum(x * y)
+        sum_x2 = np.sum(x * x)
+        
+        slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x + 1e-8)
+        
+        # Calculate R-squared
+        y_mean = np.mean(y)
+        ss_tot = np.sum((y - y_mean)**2)
+        y_pred = slope * x + (sum_y - slope * sum_x) / n
+        ss_res = np.sum((y - y_pred)**2)
+        r_squared = 1 - (ss_res / (ss_tot + 1e-8))
+        
+        trend_strength = slope * r_squared  # Slope weighted by R-squared
+        momentum_signals.append(trend_strength / np.mean(prices[-20:]))
+    
+    if not momentum_signals:
+        return 0.0, 0.0
+    
+    # Combine momentum signals
+    momentum_array = np.array(momentum_signals)
+    avg_momentum = np.mean(momentum_array)
+    momentum_consistency = 1.0 - np.std(momentum_array) / (np.abs(avg_momentum) + 1e-8)
+    confidence = max(0.0, min(1.0, momentum_consistency))
+    
+    return avg_momentum, confidence
+
+def sophisticated_mean_reversion(spread_history, all_returns):
+    """Advanced mean reversion analysis with statistical tests"""
+    if len(spread_history) < 30:
+        return 0.0, 1.0, 0.0
+    
+    # Simple mean reversion test
+    spread_diff = np.diff(spread_history)
+    spread_lag = spread_history[:-1]
+    
+    if np.std(spread_lag) < 1e-8:
+        return 0.0, 1.0, 0.0
+    
+    # Simple regression for mean reversion
+    mean_spread = np.mean(spread_lag)
+    regression_x = spread_lag - mean_spread
+    regression_y = spread_diff
+    
+    # Simple linear regression
+    n = len(regression_x)
+    sum_x = np.sum(regression_x)
+    sum_y = np.sum(regression_y)
+    sum_xy = np.sum(regression_x * regression_y)
+    sum_x2 = np.sum(regression_x * regression_x)
+    
+    slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x + 1e-8)
+    
+    # Calculate R-squared
+    y_mean = np.mean(regression_y)
+    ss_tot = np.sum((regression_y - y_mean)**2)
+    y_pred = slope * regression_x + (sum_y - slope * sum_x) / n
+    ss_res = np.sum((regression_y - y_pred)**2)
+    r_squared = 1 - (ss_res / (ss_tot + 1e-8))
+    
+    mean_reversion_speed = -slope  # Negative slope indicates mean reversion
+    
+    # Calculate z-score with adaptive window
+    adaptive_window = min(len(spread_history), max(20, len(all_returns) // 10))
+    recent_spread = spread_history[-adaptive_window:]
+    z_score = (spread_history[-1] - np.mean(recent_spread)) / (np.std(recent_spread) + 1e-8)
+    
+    # Adaptive threshold based on mean reversion strength
+    base_threshold = 1.0
+    threshold = base_threshold * (1.0 + abs(r_squared))  # Higher threshold if stronger relationship
+    
+    return z_score, threshold, mean_reversion_speed
+
+def dynamic_position_sizing(signal_strength, expected_return, variance, regime_confidence, 
+                          recent_performance, max_leverage=2.0):
+    """Dynamic position sizing using multiple factors"""
+    if variance <= 0 or signal_strength == 0:
         return 0.0
     
+    # Kelly criterion base
     kelly_fraction = expected_return / variance
-    # Cap at max leverage and ensure reasonable bounds
-    return np.clip(kelly_fraction, -max_leverage, max_leverage)
-
-# Multi-timeframe momentum
-def multi_timeframe_momentum(prices):
-    """Calculate momentum across multiple timeframes"""
-    if len(prices) < 20:
-        return 0.0
+    kelly_fraction = np.clip(kelly_fraction, -max_leverage, max_leverage)
     
-    # Short, medium, long term momentum
-    mom_5 = (prices[-1] - prices[-6]) / prices[-6] if len(prices) >= 6 else 0
-    mom_10 = (prices[-1] - prices[-11]) / prices[-11] if len(prices) >= 11 else 0
-    mom_20 = (prices[-1] - prices[-21]) / prices[-21] if len(prices) >= 21 else 0
+    # Adjust for signal strength
+    strength_multiplier = min(2.0, abs(signal_strength))
     
-    # Weighted combination favoring recent momentum
-    return 0.5 * mom_5 + 0.3 * mom_10 + 0.2 * mom_20
-
-# Enhanced volatility with GARCH-like features
-def enhanced_volatility(returns, window=20):
-    """Calculate volatility with persistence modeling"""
-    if len(returns) < window:
-        return 0.0
+    # Adjust for regime confidence
+    regime_multiplier = regime_confidence
     
-    recent_returns = returns[-window:]
+    # Adjust for recent performance
+    performance_multiplier = max(0.1, min(2.0, 1.0 + recent_performance))
     
-    # Standard volatility
-    vol = np.std(recent_returns)
+    # Combine all factors
+    final_size = kelly_fraction * strength_multiplier * regime_multiplier * performance_multiplier
     
-    # Volatility persistence (GARCH-like)
-    vol_squared = recent_returns ** 2
-    persistence = np.corrcoef(vol_squared[:-1], vol_squared[1:])[0, 1]
-    persistence = max(0, min(0.99, persistence))  # Keep in reasonable bounds
-    
-    # Adjust for persistence
-    adjusted_vol = vol * (1 + 0.5 * persistence)
-    
-    return adjusted_vol * np.sqrt(252)
-
-# Regime detection using rolling statistics
+    return np.clip(final_size, -max_leverage, max_leverage)
 def detect_regime(returns, window=30):
     """Detect market regime based on return characteristics"""
     if len(returns) < window:
@@ -197,284 +355,354 @@ def calculate_drawdown_factor(recent_pnl):
 
 def getMyPosition(prcSoFar):
     global prev_pos, rolling_sharpe, rolling_returns, trade_count, recent_pnl, volatility_regime
+    global return_history, price_history, position_history
+    
     n, t = prcSoFar.shape
-    if t < 40:
+    if t < 10:  # Much lower requirement for starting trades
         return np.zeros(nInst)
 
-    lookback = 40
+    # Store all historical data for complex analysis
     prices = prcSoFar
     returns = np.log(prices[:, 1:] / prices[:, :-1])
-    R = returns[:, -lookback:]
-    R -= np.mean(R, axis=1, keepdims=True)
-
-    # Update rolling returns and recent PnL tracking
-    if t >= 20:
-        rolling_returns[:, :-1] = rolling_returns[:, 1:]
-        rolling_returns[:, -1] = returns[:, -1]
+    
+    # Update comprehensive history storage
+    if t > 1:
+        current_returns = returns[:, -1]
+        return_history.append(current_returns.copy())
+        price_history.append(prices[:, -1].copy())
+        position_history.append(prev_pos.copy())
         
-        # Estimate today's PnL for drawdown tracking
-        if t > 1:
-            price_change = (prices[:, -1] - prices[:, -2]) / prices[:, -2]
-            estimated_pnl = np.sum(prev_pos * price_change * prices[:, -2])
-            recent_pnl[:-1] = recent_pnl[1:]
-            recent_pnl[-1] = estimated_pnl
+        # Keep only last 1000 periods to manage memory (can be increased)
+        if len(return_history) > 1000:
+            return_history = return_history[-1000:]
+            price_history = price_history[-1000:]
+            position_history = position_history[-1000:]
 
-    # Check volatility regime and get allocation factor
-    avg_returns = np.mean(returns[:, -25:], axis=0) if returns.shape[1] >= 25 else np.mean(returns, axis=0)
-    volatility_regime, vol_allocation_factor = check_volatility_regime(avg_returns)
+    # Create comprehensive return history matrix
+    if len(return_history) < 5:  # Much lower requirement
+        # Generate simple momentum-based positions for early trading
+        if t >= 5:
+            recent_returns = np.log(prices[:, -1] / prices[:, -5])
+            simple_signal = recent_returns * 20  # Amplify for position sizing
+            prices_now = prices[:, -1]
+            max_shares = max_notional / prices_now
+            simple_position = simple_signal * max_shares * 0.5
+            return np.clip(simple_position, -max_shares, max_shares)
+        return np.zeros(nInst)
     
-    # Calculate drawdown protection factor
-    drawdown_factor = calculate_drawdown_factor(recent_pnl)
+    all_returns_matrix = np.array(return_history).T  # Shape: (nInst, time)
+    all_price_matrix = np.array(price_history).T     # Shape: (nInst, time)
     
-    # Combined defensive factor
-    defensive_factor = min(vol_allocation_factor, drawdown_factor)
+    # Calculate portfolio-level returns for regime detection
+    portfolio_returns = []
+    for i in range(len(return_history)-1):
+        if i < len(position_history):
+            port_return = np.sum(position_history[i] * return_history[i+1])
+            portfolio_returns.append(port_return)
     
-    # If defensive factor is very low, exit most positions
-    if defensive_factor < 0.2:
-        return prev_pos * 0.1  # Keep only 10% of positions
+    # Advanced regime detection using all available data
+    if len(portfolio_returns) > 10:
+        regime, regime_confidence = advanced_regime_detection(portfolio_returns)
+    else:
+        regime, regime_confidence = "insufficient_data", 0.5
     
-    # PCA Decomposition
+    # Calculate VaR and CVaR for risk management
+    if len(portfolio_returns) > 20:
+        var_5, cvar_5 = calculate_var_cvar(portfolio_returns, 0.05)
+        var_1, cvar_1 = calculate_var_cvar(portfolio_returns, 0.01)
+    else:
+        var_5 = var_1 = cvar_5 = cvar_1 = 0.0
+    
+    # Stop trading if extreme risk detected (much more permissive)
+    if cvar_1 < -0.25:  # Only stop in truly extreme cases
+        return prev_pos * 0.8  # Less aggressive reduction
+    
+    # PCA analysis using longer history
+    lookback = min(100, all_returns_matrix.shape[1])
+    R = all_returns_matrix[:, -lookback:]
+    R -= np.mean(R, axis=1, keepdims=True)
+    
+    # Enhanced PCA
     cov = np.cov(R)
     eigvals, eigvecs = np.linalg.eigh(cov)
     idx = np.argsort(eigvals)[::-1]
     eigvecs = eigvecs[:, idx]
-    loadings = eigvecs[:, :12]
-
-    # Enhanced similarity matrix
+    loadings = eigvecs[:, :15]  # Use more principal components
+    
+    # Compute similarity matrix
     norm_loadings = loadings / (np.linalg.norm(loadings, axis=1, keepdims=True) + 1e-8)
     similarity = norm_loadings @ norm_loadings.T
     np.fill_diagonal(similarity, 0)
-
-    # Adjust similarity threshold based on volatility regime
-    if volatility_regime == "crisis":
-        sim_threshold = max(0.8, np.percentile(similarity, 95))  # Higher threshold in crisis
-    elif volatility_regime == "high_vol":
-        sim_threshold = max(0.75, np.percentile(similarity, 92))
-    else:
-        sim_threshold = max(0.65, np.percentile(similarity, 85))
     
-    # Enhanced pair selection
+    # Regime-adjusted similarity threshold (more permissive)
+    threshold_adj = {
+        "crisis": 0.8, "high_stress": 0.75, "high_volatility": 0.7,
+        "trending_volatile": 0.65, "trending_stable": 0.6, "anomalous": 0.75,
+        "normal": 0.6, "insufficient_data": 0.65  # Lower thresholds for more trading
+    }
+    sim_threshold = threshold_adj.get(regime, 0.7)
+    
+    # Find pairs with sophisticated filtering
     pairs = []
     for i in range(nInst):
         for j in range(i+1, nInst):
             if similarity[i, j] > sim_threshold:
-                corr = np.corrcoef(prices[i, -lookback:], prices[j, -lookback:])[0, 1]
-                if 0.4 < corr < 0.99:
-                    pairs.append((i, j))
+                # Correlation check using more data
+                if all_returns_matrix.shape[1] >= 50:
+                    corr = np.corrcoef(all_returns_matrix[i, -50:], all_returns_matrix[j, -50:])[0, 1]
+                    if 0.2 < corr < 0.97:  # Much wider range for more pairs
+                        pairs.append((i, j))
     
-    # Always ensure some pairs in normal conditions
-    if not pairs and volatility_regime in ["normal", "elevated"]:
-        for i in range(min(15, nInst)):
-            for j in range(i+1, min(i+4, nInst)):
+    # Ensure minimum number of pairs for regular trading
+    if len(pairs) < 5:  # Lower minimum for more consistent trading
+        # Add backup pairs based on highest similarity
+        similarity_flat = similarity.flatten()
+        top_indices = np.argsort(similarity_flat)[::-1]
+        for idx in top_indices[:100]:  # Check more indices
+            i, j = divmod(idx, nInst)
+            if i != j and (i, j) not in pairs and (j, i) not in pairs:
                 pairs.append((i, j))
+                if len(pairs) >= 15:  # Ensure we have enough pairs
+                    break
 
-    # Enhanced volatility analysis
-    vols = np.array([enhanced_volatility(returns[i, -25:]) for i in range(nInst)])
-    avg_vol = np.nanmean(vols)
-    
-    # Detect market regime
-    regime = detect_regime(avg_returns)
-    
-    # Very high volatility exit
-    if np.isnan(avg_vol) or avg_vol > 1.5:
-        return prev_pos * 0.05  # Keep only 5% of positions
-
-    # Enhanced signal generation with bad momentum detection
+    # Advanced signal generation using all historical data
     signal = np.zeros(nInst)
     signal_strength = np.zeros(nInst)
     expected_returns = np.zeros(nInst)
     variances = np.zeros(nInst)
     
-    # Primary momentum signals with bad momentum shorting
+    # Individual asset momentum analysis using full history
     for i in range(nInst):
-        # Detect bad momentum for aggressive shorting
-        bad_momentum_signal = detect_bad_momentum(prices[i, -20:], returns[i, -20:])
-        
-        if abs(bad_momentum_signal) > 0.1:
-            # Strong momentum signal (positive or negative)
-            signal[i] = bad_momentum_signal
-            signal_strength[i] = abs(bad_momentum_signal)
-            expected_returns[i] = bad_momentum_signal * 0.1
-            variances[i] = max(1e-6, np.var(returns[i, -10:]) if len(returns[i]) >= 10 else 0.01)
-        else:
-            # Fallback to regular momentum if no strong bad momentum
-            mom_short = multi_timeframe_momentum(prices[i, -15:])
+        if all_price_matrix.shape[1] >= 10:  # Much lower requirement
+            asset_prices = all_price_matrix[i, :]
+            asset_returns = all_returns_matrix[i, :]
             
-            if abs(mom_short) > 0.001:
-                momentum_signal = min(3.0, abs(mom_short) * 80)  # Reduced amplification
+            # Simple momentum for faster trading decisions
+            if len(asset_prices) >= 5:
+                simple_momentum = (asset_prices[-1] - asset_prices[-5]) / asset_prices[-5]
+                momentum_signal = simple_momentum * 30.0  # Strong amplification
                 
-                if mom_short > 0:
-                    signal[i] = momentum_signal
-                else:
-                    signal[i] = -momentum_signal
+                # Always trade if there's any momentum (no confidence threshold)
+                signal[i] = momentum_signal
+                signal_strength[i] = abs(momentum_signal)
+                expected_returns[i] = simple_momentum * 2
+                variances[i] = np.var(asset_returns[-10:]) if len(asset_returns) >= 10 else 0.01
+            else:
+                # Advanced momentum analysis (if enough data)
+                momentum, momentum_confidence = advanced_momentum_analysis(asset_prices, asset_returns)
+                
+                # Much lower confidence threshold
+                if momentum_confidence > 0.1:  # Reduced from 0.2
+                    base_signal = momentum * momentum_confidence * 12.0  # Increased amplification
                     
-                signal_strength[i] = momentum_signal
-                expected_returns[i] = mom_short * 8
-                variances[i] = max(1e-6, np.var(returns[i, -10:]) if len(returns[i]) >= 10 else 0.01)
+                    # Regime adjustment for momentum (more permissive)
+                    regime_momentum_multiplier = {
+                        "trending_stable": 3.0, "trending_volatile": 2.5, "normal": 2.0,
+                        "high_volatility": 1.5, "anomalous": 1.2, "crisis": 0.8, "high_stress": 1.0
+                    }.get(regime, 1.5)  # Higher multipliers for more trading
+                    
+                    final_momentum_signal = base_signal * regime_momentum_multiplier
+                    
+                    # Apply position sizing
+                    asset_variance = np.var(asset_returns[-15:]) if len(asset_returns) >= 15 else 0.01
+                    recent_sharpe = rolling_sharpe[i] if rolling_sharpe[i] != 0 else 0
+                    
+                    position_size = dynamic_position_sizing(
+                        abs(final_momentum_signal), momentum * momentum_confidence,
+                        asset_variance, regime_confidence, recent_sharpe, max_leverage=3.0  # Higher leverage
+                    )
+                    
+                    signal[i] = np.sign(final_momentum_signal) * abs(position_size)
+                    signal_strength[i] = abs(final_momentum_signal)
+                    expected_returns[i] = momentum * momentum_confidence
+                    variances[i] = asset_variance
     
-    # Secondary mean reversion pairs (reduced weight in volatile conditions)
-    mean_reversion_weight = 0.3 if volatility_regime in ["crisis", "high_vol"] else 0.5
-    
-    for i, j in pairs[:20]:  # Fewer pairs in volatile conditions
-        spread_hist = prices[i, -lookback:] - prices[j, -lookback:]
-        
-        # Adjust threshold based on volatility regime
-        if volatility_regime == "crisis":
-            z_score, threshold = enhanced_mean_reversion_signal(spread_hist, window=15)
-            threshold *= 1.5  # Higher threshold in crisis
-        else:
-            z_score, threshold = enhanced_mean_reversion_signal(spread_hist, window=20)
-        
-        ou_speed = ou_mean_reversion_speed(spread_hist)
-        spread_returns = np.diff(spread_hist) / (np.abs(spread_hist[:-1]) + 1e-8)
-        expected_return_spread = np.mean(spread_returns[-6:]) if len(spread_returns) >= 6 else 0
-        
-        if abs(z_score) > threshold:
-            base_signal = min(1.5, abs(z_score) / threshold)  # Reduced signal strength
-            ou_boost = 1 + min(0.5, ou_speed * 2)
+    # Pairs trading with sophisticated mean reversion
+    for i, j in pairs[:50]:  # Increased from 40 for more trading
+        if all_price_matrix.shape[1] >= 10:  # Much lower requirement
+            # Create spread history
+            spread_history = all_price_matrix[i, :] - all_price_matrix[j, :]
+            portfolio_returns_for_spread = portfolio_returns if len(portfolio_returns) > 0 else [0]
             
-            regime_multiplier = {
-                "normal": 1.0,
-                "trending": 0.5,  # Less mean reversion in trending
-                "high_vol": 0.3,  # Much less in high vol
-                "crisis": 0.1     # Minimal in crisis
-            }.get(volatility_regime, 0.5)
-            
-            final_signal = base_signal * ou_boost * regime_multiplier * mean_reversion_weight
-            
-            if z_score > threshold:
-                signal[i] -= final_signal
-                signal[j] += final_signal
-            elif z_score < -threshold:
-                signal[i] += final_signal
-                signal[j] -= final_signal
+            # Simple mean reversion for faster decisions
+            if len(spread_history) >= 10:
+                spread_mean = np.mean(spread_history[-10:])
+                spread_std = np.std(spread_history[-10:]) + 1e-8
+                z_score = (spread_history[-1] - spread_mean) / spread_std
                 
-            signal_strength[i] += final_signal
-            signal_strength[j] += final_signal
+                # Very permissive trading threshold
+                if abs(z_score) > 0.5:  # Much lower threshold
+                    pair_signal_strength = min(3.0, abs(z_score)) * 0.5
+                    
+                    if z_score > 0.5:  # Spread too high, short i, long j
+                        signal[i] -= pair_signal_strength
+                        signal[j] += pair_signal_strength
+                    elif z_score < -0.5:  # Spread too low, long i, short j
+                        signal[i] += pair_signal_strength
+                        signal[j] -= pair_signal_strength
+                    
+                    # Update tracking
+                    signal_strength[i] = np.maximum(signal_strength[i], pair_signal_strength)
+                    signal_strength[j] = np.maximum(signal_strength[j], pair_signal_strength)
+                    expected_returns[i] += np.sign(signal[i]) * 0.01
+                    expected_returns[j] += np.sign(signal[j]) * 0.01
+                    variances[i] = max(float(variances[i]), spread_std**2)
+                    variances[j] = max(float(variances[j]), spread_std**2)
+            else:
+                # Sophisticated mean reversion analysis (if enough data)
+                z_score, threshold, mean_rev_speed = sophisticated_mean_reversion(
+                    spread_history, portfolio_returns_for_spread
+                )
+                
+                # More permissive trading conditions
+                if abs(z_score) > threshold * 0.5 and mean_rev_speed > 0.01:  # Much lower thresholds
+                    # Calculate signal strength based on z-score and mean reversion speed
+                    base_signal = min(3.0, abs(z_score) / threshold) * mean_rev_speed
+                    
+                    # Regime adjustment for mean reversion (more permissive)
+                    regime_mr_multiplier = {
+                        "high_volatility": 2.5, "crisis": 3.0, "high_stress": 2.8,
+                        "anomalous": 2.2, "normal": 2.0, "trending_stable": 1.2, "trending_volatile": 1.8
+                    }.get(regime, 1.5)  # Higher multipliers
+                    
+                    final_mr_signal = base_signal * regime_mr_multiplier * 1.2  # Increased weight
+                    
+                    # Calculate expected returns and variances for the pair
+                    spread_returns = np.diff(spread_history[-20:]) if len(spread_history) >= 21 else [0]
+                    spread_variance = np.var(spread_returns) if len(spread_returns) > 3 else 0.01
+                    expected_spread_return = np.mean(spread_returns) if len(spread_returns) > 0 else 0
+                    
+                    if z_score > threshold:  # Spread too high, short i, long j
+                        signal[i] -= final_mr_signal
+                        signal[j] += final_mr_signal
+                        expected_returns[i] -= expected_spread_return
+                        expected_returns[j] += expected_spread_return
+                    elif z_score < -threshold:  # Spread too low, long i, short j
+                        signal[i] += final_mr_signal
+                        signal[j] -= final_mr_signal
+                        expected_returns[i] += expected_spread_return
+                        expected_returns[j] -= expected_spread_return
+                    
+                    signal_strength[i] = np.maximum(signal_strength[i], final_mr_signal)
+                    signal_strength[j] = np.maximum(signal_strength[j], final_mr_signal)
+                    variances[i] = max(float(variances[i]), spread_variance)
+                    variances[j] = max(float(variances[j]), spread_variance)
 
-    # Apply stop-loss and risk management
-    for i in range(nInst):
-        # Stop-loss based on recent performance
-        if rolling_sharpe[i] < -1.5:  # Very poor recent performance
-            signal[i] *= 0.1  # Drastically reduce signal
-        elif rolling_sharpe[i] < -1.0:
-            signal[i] *= 0.3
-        elif rolling_sharpe[i] < -0.5:
-            signal[i] *= 0.6
+    # Portfolio optimization
+    if np.any(signal != 0):
+        # Create expected returns and covariance matrix for optimization
+        non_zero_indices = np.where(signal != 0)[0]
+        if len(non_zero_indices) > 1:
+            sub_expected_returns = expected_returns[non_zero_indices]
+            sub_returns_matrix = all_returns_matrix[non_zero_indices, -50:] if all_returns_matrix.shape[1] >= 50 else all_returns_matrix[non_zero_indices, :]
+            sub_cov_matrix = np.cov(sub_returns_matrix)
+            
+            # Portfolio optimization
+            optimized_weights = portfolio_optimization(sub_expected_returns, sub_cov_matrix, risk_aversion=2.0)
+            
+            # Apply optimized weights back to signals
+            for idx, orig_idx in enumerate(non_zero_indices):
+                if idx < len(optimized_weights):
+                    signal[orig_idx] = optimized_weights[idx] * np.sign(signal[orig_idx]) * signal_strength[orig_idx]
 
-    # Ensure some trading in normal conditions, but not in crisis
+    # Risk management and position sizing
     total_signal = np.sum(np.abs(signal))
-    if total_signal < 0.01 and volatility_regime in ["normal", "elevated"]:
-        # Create minimal momentum signals
+    if total_signal < 0.001:  # Much lower threshold for ensuring trading
+        # Force some trading based on recent returns if no signals
         for i in range(nInst):
-            recent_return = returns[i, -1] if len(returns[i]) > 0 else 0
-            signal[i] = recent_return * 20  # Much reduced amplification
-            expected_returns[i] = recent_return * 2
-            variances[i] = 0.01
-            signal_strength[i] = abs(signal[i])
-
-    trade_count += 1
-
-    # Defensive capital allocation with volatility and drawdown protection
-    total_signal = np.sum(np.abs(signal))
+            if len(return_history) >= 5:
+                recent_momentum = np.mean(all_returns_matrix[i, -5:])
+                if abs(recent_momentum) > 0.001:  # Very low threshold
+                    signal[i] = recent_momentum * 50  # Amplify for trading
+                    expected_returns[i] = recent_momentum * 5
+                    variances[i] = 0.02
+                    signal_strength[i] = abs(signal[i])
+        
+        total_signal = np.sum(np.abs(signal))
+        if total_signal < 0.001:
+            # Force minimal trading with random walk component
+            np.random.seed(trade_count)  # Deterministic randomness
+            random_signals = np.random.randn(nInst) * 0.1
+            signal = random_signals
+            expected_returns = random_signals * 0.5
+            variances[:] = 0.02
+            signal_strength = np.abs(signal)
+            return prev_pos * 0.98  # Small decay instead of no trading
     
-    # Base weights from signals
-    weights = signal / (total_signal + 1e-6)
-    
-    # Kelly criterion scaling with reduced leverage
-    kelly_weights = np.zeros(nInst)
-    for i in range(nInst):
-        if abs(weights[i]) > 1e-8:
-            max_leverage = 1.5 if volatility_regime == "normal" else 0.8  # Much lower leverage
-            kelly_size = kelly_position_size(expected_returns[i], variances[i], max_leverage)
-            kelly_weights[i] = weights[i] * abs(kelly_size)
-    
-    # Normalize Kelly weights
-    kelly_total = np.sum(np.abs(kelly_weights))
-    if kelly_total > 0:
-        kelly_weights = kelly_weights / kelly_total
+    # Calculate portfolio-level risk metrics
+    if len(portfolio_returns) > 10:
+        portfolio_vol = np.std(portfolio_returns) * np.sqrt(252)
+        portfolio_sharpe = np.mean(portfolio_returns) / (np.std(portfolio_returns) + 1e-8) * np.sqrt(252)
     else:
-        kelly_weights = weights
+        portfolio_vol = 0.3
+        portfolio_sharpe = 0.0
     
-    # Defensive capital scaling based on regime and performance
-    # 1. Base scaling (much more conservative)
-    base_scale = {
-        "crisis": 0.2,      # 20% allocation in crisis
-        "high_vol": 0.5,    # 50% in high vol
-        "elevated": 0.8,    # 80% in elevated vol
-        "normal": 1.5       # 150% in normal (reduced from 4x)
-    }.get(volatility_regime, 1.0)
+    # Regime-based capital allocation (more aggressive for trading)
+    base_allocation = {
+        "crisis": 0.4, "high_stress": 0.6, "high_volatility": 0.8, "anomalous": 0.7,
+        "trending_volatile": 1.2, "trending_stable": 1.5, "normal": 1.3, "insufficient_data": 1.0
+    }.get(regime, 0.8)  # Higher allocations across the board
     
-    # 2. Volatility scaling (defensive)
-    vol_scale = min(1.5, 0.3 / (avg_vol + 1e-6))  # More conservative
+    # Performance-based scaling
+    performance_scale = max(0.2, min(2.0, 1.0 + portfolio_sharpe))
     
-    # 3. Signal confidence scaling
-    confidence = np.mean(signal_strength[signal_strength > 0]) if np.any(signal_strength > 0) else 0
-    confidence_scale = 0.5 + 0.5 * min(1.0, confidence / 3.0)  # More conservative
+    # Volatility-based scaling
+    vol_scale = min(2.0, 0.3 / (portfolio_vol + 1e-6))
     
-    # 4. Regime-based scaling (very defensive)
-    regime_scale = {
-        "normal": 1.2,
-        "trending": 1.0,    # Reduced from 2.5
-        "high_vol": 0.4,    # Much more defensive
-        "crisis": 0.2       # Very defensive
-    }.get(regime, 0.8)
+    # CVaR-based scaling
+    cvar_scale = max(0.1, min(1.5, 1.0 + cvar_5 * 10)) if cvar_5 != 0 else 1.0
     
-    # 5. Performance-based scaling
-    recent_sharpe = np.mean(rolling_sharpe[rolling_sharpe != 0]) if np.any(rolling_sharpe != 0) else 0
-    performance_scale = max(0.2, min(1.5, 1.0 + recent_sharpe))
+    # Combined scaling (more aggressive)
+    total_scale = base_allocation * performance_scale * vol_scale * cvar_scale * regime_confidence
+    total_scale = min(4.0, max(0.5, total_scale))  # Higher cap, higher floor
     
-    # 6. Drawdown protection
-    drawdown_scale = drawdown_factor
-    
-    # Combined scaling with all defensive factors
-    total_scale = (base_scale * vol_scale * confidence_scale * regime_scale * 
-                  performance_scale * drawdown_scale * defensive_factor)
-    total_scale = min(2.0, total_scale)  # Cap at 2x leverage (much lower)
-    
-    dollar_alloc = kelly_weights * total_capital * total_scale
+    # Normalize signals and apply scaling
+    weights = signal / (total_signal + 1e-6)
+    dollar_alloc = weights * total_capital * total_scale
     
     prices_now = prices[:, -1]
     position = dollar_alloc / prices_now
-
-    # Much more conservative position limits
+    
+    # Apply position limits based on individual asset risk
     max_shares = max_notional / prices_now
-    
-    # Volatility-adjusted limits (very conservative)
-    vol_adjusted_max = max_shares * (0.5 / (vols + 1e-6))  # More conservative
-    vol_adjusted_max = np.clip(vol_adjusted_max, max_shares * 0.1, max_shares * 1.5)
-    
-    position = np.clip(position, -vol_adjusted_max, vol_adjusted_max)
-    
-    # Performance-based adjustments (more aggressive reduction for poor performance)
     for i in range(nInst):
-        if abs(position[i]) > 0:
-            recent_returns_asset = returns[i, -8:]
-            if len(recent_returns_asset) >= 5:
-                sharpe_proxy = np.mean(recent_returns_asset) / (np.std(recent_returns_asset) + 1e-6)
-                rolling_sharpe[i] = 0.6 * rolling_sharpe[i] + 0.4 * sharpe_proxy
-                
-                # More aggressive reduction for poor performance
-                if rolling_sharpe[i] < -1.2:
-                    position[i] *= 0.1  # Reduce to 10%
-                elif rolling_sharpe[i] < -0.8:
-                    position[i] *= 0.3  # Reduce to 30%
-                elif rolling_sharpe[i] < -0.4:
-                    position[i] *= 0.6  # Reduce to 60%
-                elif rolling_sharpe[i] > 0.5:  # Boost good performers (less aggressive)
-                    position[i] *= 1.1  # Small boost
-
-    # Adaptive smoothing based on volatility regime
-    if volatility_regime == "crisis":
-        alpha = 0.9   # High smoothing in crisis
-    elif volatility_regime == "high_vol":
-        alpha = 0.8   # High smoothing in high vol
-    elif volatility_regime == "elevated":
-        alpha = 0.7   # Medium smoothing
-    else:
-        alpha = 0.6   # Normal smoothing
-        
-    position = alpha * position + (1 - alpha) * prev_pos
-    prev_pos = position
-
+        if len(return_history) >= 20:
+            asset_vol = np.std(all_returns_matrix[i, -20:]) * np.sqrt(252)
+            vol_adjusted_limit = max_shares[i] * (0.4 / (asset_vol + 1e-6))
+            position[i] = np.clip(position[i], -vol_adjusted_limit, vol_adjusted_limit)
+    
+    # Final risk checks and ensure some trading always happens
+    total_final_signal = np.sum(np.abs(position))
+    if total_final_signal < max_notional * 0.1:  # If total position is too small
+        # Boost positions to ensure meaningful trading
+        scaling_factor = max_notional * 0.2 / (total_final_signal + 1e-6)
+        position *= min(scaling_factor, 3.0)  # Cap the boost
+    
+    for i in range(nInst):
+        if rolling_sharpe[i] < -2.0:  # Very poor recent performance
+            position[i] *= 0.1
+        elif rolling_sharpe[i] < -1.0:
+            position[i] *= 0.3
+        elif rolling_sharpe[i] > 1.0:  # Very good performance
+            position[i] *= 1.3
+    
+    # Adaptive smoothing based on regime and volatility (less smoothing for more trading)
+    smoothing_factor = {
+        "crisis": 0.6, "high_stress": 0.55, "high_volatility": 0.5,
+        "anomalous": 0.45, "trending_volatile": 0.3, "trending_stable": 0.2, "normal": 0.3
+    }.get(regime, 0.4)
+    
+    position = smoothing_factor * position + (1 - smoothing_factor) * prev_pos
+    
+    # Update performance tracking
+    if len(return_history) >= 2:
+        for i in range(nInst):
+            if len(return_history) >= 15:
+                recent_returns = all_returns_matrix[i, -15:]
+                sharpe_proxy = np.mean(recent_returns) / (np.std(recent_returns) + 1e-6)
+                rolling_sharpe[i] = 0.7 * rolling_sharpe[i] + 0.3 * sharpe_proxy
+    
+    prev_pos = position.copy()
+    trade_count += 1
+    
     return np.round(position)
