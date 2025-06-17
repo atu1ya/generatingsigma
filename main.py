@@ -2,41 +2,51 @@ import numpy as np
 
 nInst = 50
 max_notional = 10_000
+total_capital = nInst * max_notional  # $500k
+
+# Memory to smooth transitions
+previous_position = np.zeros(nInst)
 
 def getMyPosition(prcSoFar):
+    global previous_position
     n, t = prcSoFar.shape
-    if t < 21:
+    if t < 30:
         return np.zeros(n)
 
-    lookback = 20
-    short_term = 5
+    lookback = 15
+    smooth = 5
 
-    # Compute short-term return
-    short_returns = np.log(prcSoFar[:, -1] / prcSoFar[:, -short_term-1])
-    mean_ret = np.mean(short_returns)
-    std_ret = np.std(short_returns) + 1e-6
-    z_scores = (short_returns - mean_ret) / std_ret
+    # Log returns (recent and average)
+    returns = np.log(prcSoFar[:, 1:] / prcSoFar[:, :-1])
+    recent_ret = np.mean(returns[:, -smooth:], axis=1)
+    long_term_avg = np.mean(returns[:, -lookback:], axis=1)
 
-    # Mean reversion: short high z, long low z
-    signal = -z_scores
+    # Signal = mean reversion
+    signal = long_term_avg - recent_ret
 
-    # Scale using inverse variance (from historical returns)
-    ret_hist = np.log(prcSoFar[:, -lookback:] / prcSoFar[:, -lookback-1:-1])
-    vol = np.std(ret_hist, axis=1) + 1e-6
-    inv_vol = 1 / vol
-    weights = signal * inv_vol
+    # Rank signals (robust to outliers)
+    ranks = signal.argsort().argsort()
+    norm_signal = ranks - np.mean(ranks)  # mean zero
+    norm_signal /= np.sum(np.abs(norm_signal)) + 1e-6  # scale to 1
 
-    # Normalise weights
-    weights -= np.mean(weights)  # make it dollar-neutral
-    weights /= np.sum(np.abs(weights)) + 1e-6
+    # Light volatility adjustment
+    vol = np.std(returns[:, -lookback:], axis=1) + 1e-6
+    vol_scale = 1 / vol
+    vol_scale /= np.max(vol_scale)
+    weights = norm_signal * vol_scale
 
-    # Allocate $1M capital
-    dollar_alloc = weights * 1_000_000
+    # Dollar allocation
     prices_now = prcSoFar[:, -1]
+    dollar_alloc = weights * total_capital
     position = dollar_alloc / prices_now
 
-    # Enforce position cap
+    # Clip to $10k limit
     max_shares = max_notional / prices_now
     position = np.clip(position, -max_shares, max_shares)
+
+    # Smooth transition (reduce turnover)
+    alpha = 0.4  # smoothing factor (0.3–0.5 is good)
+    position = alpha * position + (1 - alpha) * previous_position
+    previous_position = position  # update memory
 
     return np.round(position)
