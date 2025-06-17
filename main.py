@@ -1,7 +1,7 @@
 import numpy as np
 
 nInst = 50
-max_notional = 10_000  # Max $10K position per stock
+max_notional = 10_000
 
 def getMyPosition(prcSoFar):
     n, t = prcSoFar.shape
@@ -11,55 +11,32 @@ def getMyPosition(prcSoFar):
     lookback = 20
     short_term = 5
 
-    prices = prcSoFar
-    returns = np.log(prices[:, 1:] / prices[:, :-1])
-    recent_returns = np.log(prices[:, -1] / prices[:, -short_term-1])
-    vol = np.std(returns[:, -lookback:], axis=1) + 1e-6  # avoid div by 0
+    # Compute short-term return
+    short_returns = np.log(prcSoFar[:, -1] / prcSoFar[:, -short_term-1])
+    mean_ret = np.mean(short_returns)
+    std_ret = np.std(short_returns) + 1e-6
+    z_scores = (short_returns - mean_ret) / std_ret
 
-    # Cross-sectional momentum
-    ranked = recent_returns.argsort()
-    longs = ranked[-int(n * 0.2):]
-    shorts = ranked[:int(n * 0.2)]
-    cs_momentum = np.zeros(n)
-    cs_momentum[longs] = 1
-    cs_momentum[shorts] = -1
+    # Mean reversion: short high z, long low z
+    signal = -z_scores
 
-    # Correlation matrix
-    corr_matrix = np.corrcoef(returns[:, -lookback:])
-    pairs = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if corr_matrix[i, j] > 0.9:
-                pairs.append((i, j))
+    # Scale using inverse variance (from historical returns)
+    ret_hist = np.log(prcSoFar[:, -lookback:] / prcSoFar[:, -lookback-1:-1])
+    vol = np.std(ret_hist, axis=1) + 1e-6
+    inv_vol = 1 / vol
+    weights = signal * inv_vol
 
-    # Pair spread trading
-    spread_signal = np.zeros(n)
-    for i, j in pairs:
-        spread = prices[i, -1] - prices[j, -1]
-        spread_hist = prices[i, -lookback:] - prices[j, -lookback:]
-        z = (spread - spread_hist.mean()) / (spread_hist.std() + 1e-6)
-        if z > 1:
-            spread_signal[i] -= 1
-            spread_signal[j] += 1
-        elif z < -1:
-            spread_signal[i] += 1
-            spread_signal[j] -= 1
+    # Normalise weights
+    weights -= np.mean(weights)  # make it dollar-neutral
+    weights /= np.sum(np.abs(weights)) + 1e-6
 
-    # Combine signals
-    combined_signal = (0.5 * cs_momentum + 0.5 * spread_signal)
+    # Allocate $1M capital
+    dollar_alloc = weights * 1_000_000
+    prices_now = prcSoFar[:, -1]
+    position = dollar_alloc / prices_now
 
-    # Position sizing: inverse-volatility weighted
-    weights = combined_signal / vol
-    weights[np.isnan(weights)] = 0
-    weights /= np.sum(np.abs(weights)) + 1e-6  # Normalize to unit leverage
-
-    # Convert weights to $ value and then to shares
-    prices_now = prices[:, -1]
-    dollar_positions = weights * 1_000_000
-    share_positions = dollar_positions / prices_now
-
-    # Enforce $10K position limit
+    # Enforce position cap
     max_shares = max_notional / prices_now
-    share_positions = np.clip(share_positions, -max_shares, max_shares)
+    position = np.clip(position, -max_shares, max_shares)
 
-    return np.round(share_positions)
+    return np.round(position)
