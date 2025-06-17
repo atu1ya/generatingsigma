@@ -2,72 +2,80 @@ import numpy as np
 
 nInst = 50
 max_notional = 10_000
-total_capital = nInst * max_notional
-
 prev_pos = np.zeros(nInst)
 
 def getMyPosition(prcSoFar):
     global prev_pos
     n, t = prcSoFar.shape
     if t < 60:
-        return np.zeros(n)
+        return np.zeros(nInst)
 
     lookback = 50
-    ret_window = 1  # use daily returns
-
+    recent_window = 5
     prices = prcSoFar
-    log_returns = np.log(prices[:, 1:] / prices[:, :-1])
+    returns = np.log(prices[:, 1:] / prices[:, :-1])
 
-    # STEP 1: Extract principal components (factors) using PCA
-    R = log_returns[:, -lookback:]  # shape: [nInst, T]
-    R -= R.mean(axis=1, keepdims=True)  # demean
+    # --- PCA: Extract 1st principal component as market trend ---
+    R = returns[:, -lookback:]
+    R -= R.mean(axis=1, keepdims=True)
     cov = np.cov(R)
     eigvals, eigvecs = np.linalg.eigh(cov)
     idx = np.argsort(eigvals)[::-1]
-    eigvecs = eigvecs[:, idx]
+    pc1 = eigvecs[:, idx[0]]
+    market_factor = pc1 @ R  # shape: [T]
 
-    k = 5  # number of PCA factors
-    factors = eigvecs[:, :k].T @ R  # shape: [k, T]
+    # If market is trending (PC1 strong), skip mean-reversion
+    trend_strength = np.std(market_factor)
+    if trend_strength > 0.04:
+        return np.zeros(nInst)  # stay out when trend dominates
 
-    # STEP 2: Rolling regression: get each asset’s beta to each factor
+    # --- Compute residual alpha ---
+    k = 3
+    factors = eigvecs[:, idx[:k]].T @ R
     betas = np.zeros((nInst, k))
     for i in range(nInst):
-        y = R[i]
         X = factors.T
-        beta_i, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-        betas[i] = beta_i
+        y = R[i]
+        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        betas[i] = beta
 
-    # STEP 3: Predict expected returns from factor exposure
-    latest_factors = factors[:, -1]  # shape: [k]
-    expected_ret = betas @ latest_factors  # shape: [nInst]
+    # Predicted returns
+    latest_factors = factors[:, -1]
+    expected_ret = betas @ latest_factors
+    actual_ret = np.log(prices[:, -1] / prices[:, -1 - recent_window])
+    alpha = actual_ret - expected_ret
 
-    # STEP 4: Get actual latest return
-    recent_ret = np.log(prices[:, -1] / prices[:, -1 - ret_window])
+    # --- Residual filtering ---
+    vol = np.std(returns[:, -lookback:], axis=1) + 1e-6
+    confidence = 1 / vol
+    z = (alpha - np.mean(alpha)) / (np.std(alpha) + 1e-6)
+    signal = z * confidence
 
-    # STEP 5: Compute alpha (residuals)
-    alpha = recent_ret - expected_ret
+    # --- Trade only strongest alphas ---
+    threshold = np.percentile(np.abs(signal), 80)
+    filtered_signal = np.where(np.abs(signal) >= threshold, signal, 0)
 
-    # STEP 6: Cross-sectional z-score of alpha
-    alpha_z = (alpha - alpha.mean()) / (alpha.std() + 1e-6)
+    # Normalize to use capital based on number of trades
+    num_active = np.count_nonzero(filtered_signal)
+    if num_active == 0:
+        return np.zeros(nInst)
 
-    # STEP 7: Inverse-vol weighting
-    vol = np.std(log_returns[:, -lookback:], axis=1) + 1e-6
-    weights = alpha_z / vol
-    weights -= weights.mean()  # dollar-neutral
-    weights /= np.sum(np.abs(weights)) + 1e-6  # use all capital
+    weights = filtered_signal
+    weights /= np.sum(np.abs(weights)) + 1e-6
 
-    # STEP 8: Capital allocation
-    dollar_alloc = weights * total_capital
+    # Dollar allocation
+    total_cap = num_active * max_notional  # adaptive capital use
+    dollar_alloc = weights * total_cap
     prices_now = prices[:, -1]
-    position = dollar_alloc / prices_now
+    pos = dollar_alloc / prices_now
 
-    # Enforce per-stock $10k cap
+    # Cap at $10k
     max_shares = max_notional / prices_now
-    position = np.clip(position, -max_shares, max_shares)
+    pos = np.clip(pos, -max_shares, max_shares)
 
-    # STEP 9: Smooth position changes
-    alpha = 0.4
-    position = alpha * position + (1 - alpha) * prev_pos
-    prev_pos = position
+    # Smooth transitions
+    alpha = 0.3
+    pos = alpha * pos + (1 - alpha) * prev_pos
+    prev_pos = pos
 
-    return np.round(position)
+    return np.round(pos)
