@@ -46,7 +46,7 @@ def getMyPosition(prcSoFar):
             spread_signal[j] -= 1
 
     # Combine signals
-    combined_signal = - (0.5 * cs_momentum + 0.5 * spread_signal)
+    combined_signal = (0.5 * cs_momentum + 0.5 * spread_signal)
 
     # Position sizing: inverse-volatility weighted
     weights = combined_signal / vol
