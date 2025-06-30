@@ -1,361 +1,501 @@
-"""
-Refined Profitable Quantitative Trading Strategy
-
-Focus on high-quality signals with strict risk management:
-1. Selective Pairs Trading with strong cointegration
-2. Momentum with volatility filtering  
-3. Conservative position sizing
-4. Strict risk controls and stop losses
-
-STRATEGY PRINCIPLES:
-- Quality over quantity: fewer, higher-confidence trades
-- Strong risk management with position limits
-- Momentum and mean reversion signals must align
-- Conservative capital utilization with gradual scaling
-"""
-
 import numpy as np
-from scipy import stats
-from scipy.stats import zscore
+import warnings
+warnings.filterwarnings('ignore')
 
-# Constants for the trading strategy
 nInst = 50
-max_notional = 10_000
-total_capital = nInst * max_notional
+currentPos = np.zeros(nInst)
+model_weights = None
+market_regime = 'neutral'
+performance_tracker = []
+signal_history = []
 
-# Position tracking
-prev_pos = np.zeros(nInst, dtype=float)
-position_holding_time = np.zeros(nInst, dtype=float)
-trade_count = 0
-pair_spreads = {}
-active_pairs = set()
-recent_pnl = []  # Track recent performance
+def compute_multi_horizon_features(prices):
+    """Compute features across multiple time horizons for better prediction"""
+    n_inst, n_days = prices.shape
+    
+    if n_days < 25:
+        return None
+    
+    # Log returns
+    log_prices = np.log(np.maximum(prices, 1e-8))
+    returns = np.diff(log_prices, axis=1)
+    
+    features = []
+    
+    for i in range(n_inst):
+        inst_returns = returns[i, :]
+        inst_prices = prices[i, :]
+        
+        # Multi-horizon momentum (1d, 5d, 10d, 20d)
+        mom_1d = inst_returns[-1] if n_days > 1 else 0
+        mom_5d = np.sum(inst_returns[-5:]) if n_days > 5 else 0
+        mom_10d = np.sum(inst_returns[-10:]) if n_days > 10 else 0
+        mom_20d = np.sum(inst_returns[-20:]) if n_days > 20 else 0
+        
+        # Mean reversion signals
+        mean_20 = np.mean(inst_returns[-20:]) if n_days > 20 else 0
+        std_20 = np.std(inst_returns[-20:]) if n_days > 20 else 0.01
+        z_score = (inst_returns[-1] - mean_20) / std_20 if std_20 > 0 else 0
+        
+        # Volatility (10-day rolling)
+        volatility = np.std(inst_returns[-10:]) if n_days > 10 else 0.01
+        
+        # Price trend vs moving averages
+        sma_5 = np.mean(inst_prices[-5:]) if n_days > 5 else inst_prices[-1]
+        sma_20 = np.mean(inst_prices[-20:]) if n_days > 20 else inst_prices[-1]
+        price_vs_sma5 = (inst_prices[-1] - sma_5) / sma_5 if sma_5 > 0 else 0
+        price_vs_sma20 = (inst_prices[-1] - sma_20) / sma_20 if sma_20 > 0 else 0
+        
+        # Bollinger band position
+        bb_position = (inst_prices[-1] - sma_20) / (2 * std_20 * sma_20) if std_20 > 0 and sma_20 > 0 else 0
+        
+        features.append([
+            mom_1d, mom_5d, mom_10d, mom_20d,     # Momentum features
+            z_score, -z_score,                    # Mean reversion (positive and negative)
+            volatility, 1.0/max(volatility, 0.001), # Volatility and inverse vol
+            price_vs_sma5, price_vs_sma20,        # Trend features
+            bb_position                           # Technical indicator
+        ])
+    
+    features_array = np.array(features)
+    
+    # Cross-sectional z-scores (relative performance)
+    cross_sectional_features = []
+    for j in range(features_array.shape[1]):
+        col = features_array[:, j]
+        if np.std(col) > 0:
+            cs_z = (col - np.mean(col)) / np.std(col)
+        else:
+            cs_z = np.zeros_like(col)
+        cross_sectional_features.append(cs_z)
+    
+    cross_sectional_features = np.array(cross_sectional_features).T
+    
+    # Combine individual and cross-sectional features
+    all_features = np.concatenate([features_array, cross_sectional_features], axis=1)
+    
+    return all_features
 
-# Conservative Strategy Parameters
-lookback_short = 10       # Short-term lookback
-lookback_medium = 20      # Medium-term lookbook  
-lookback_long = 30        # Long-term lookback
-correlation_lookback = 40  # Correlation calculation window
+def detect_market_regime(prices):
+    """Improved market regime detection with better stability"""
+    n_inst, n_days = prices.shape
+    
+    if n_days < 20:
+        return 'neutral'
+    
+    # Calculate market index (equal weight of all instruments)
+    log_prices = np.log(np.maximum(prices, 1e-8))
+    market_returns = np.mean(np.diff(log_prices, axis=1), axis=0)
+    
+    if len(market_returns) < 15:
+        return 'neutral'
+    
+    # Use longer lookback for stability
+    lookback = min(15, len(market_returns))
+    recent_returns = market_returns[-lookback:]
+    
+    # Trend metrics
+    cumulative_return = np.sum(recent_returns)
+    volatility = np.std(recent_returns)
+    trend_strength = abs(cumulative_return) / (volatility * np.sqrt(lookback))
+    
+    # Correlation with time (trend persistence)
+    time_indices = np.arange(lookback)
+    if volatility > 0:
+        trend_correlation = np.corrcoef(recent_returns, time_indices)[0, 1]
+    else:
+        trend_correlation = 0
+    
+    # Regime classification with more conservative thresholds
+    if trend_strength > 1.5 and abs(trend_correlation) > 0.3:
+        if cumulative_return > 0:
+            return 'trending_up'
+        else:
+            return 'trending_down'
+    elif volatility > np.std(market_returns[-30:] if len(market_returns) >= 30 else market_returns) * 1.3:
+        return 'volatile'
+    else:
+        return 'mean_reverting'
 
-# More reasonable thresholds for actual trading
-momentum_threshold = 0.01   # Very low threshold (1%) to ensure trades
-mean_revert_threshold = 0.8  # Lower threshold for mean reversion
-pairs_z_entry = 1.0        # Lower entry threshold for pairs
-pairs_z_exit = 0.3         # Conservative exit threshold
-correlation_min = 0.3      # Much lower correlation requirement
+def train_simple_predictor(features, returns, regime):
+    """Train a simple linear model with relaxed requirements"""
+    if features is None or len(features) < 5:
+        return None
+    
+    n_inst, n_features = features.shape
+    
+    # Use shorter training window for more data
+    lookback = min(15, len(returns[0]) - 1)
+    if lookback < 5:
+        return None
+    
+    X_train = []
+    y_train = []
+    
+    # Build training data with relaxed target definition
+    for t in range(max(0, len(returns[0]) - lookback), len(returns[0]) - 1):
+        for i in range(n_inst):
+            if t < len(returns[i]) - 1:
+                # Features at time t
+                inst_features = features[i, :8].copy()  # Use first 8 features only
+                
+                # Target: Next day return (regression approach)
+                next_return = returns[i][t + 1]
+                
+                # Use all data, not just large moves
+                X_train.append(inst_features)
+                y_train.append(next_return)
+    
+    if len(X_train) < 10:
+        return None
+    
+    X_train = np.array(X_train)
+    y_train = np.array(y_train)
+    
+    # Remove any NaN/inf values
+    valid_mask = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
+    X_train = X_train[valid_mask]
+    y_train = y_train[valid_mask]
+    
+    if len(X_train) < 5:
+        return None
+    
+    try:
+        # Simple linear regression with regularization
+        X_mean = np.mean(X_train, axis=0)
+        X_std = np.std(X_train, axis=0) + 1e-8
+        X_scaled = (X_train - X_mean) / X_std
+        
+        # Add intercept term
+        X_with_intercept = np.column_stack([np.ones(len(X_scaled)), X_scaled])
+        
+        # Ridge regression solution
+        lambda_reg = 0.1
+        I = np.eye(X_with_intercept.shape[1])
+        I[0, 0] = 0  # Don't regularize intercept
+        
+        weights = np.linalg.solve(
+            X_with_intercept.T @ X_with_intercept + lambda_reg * I,
+            X_with_intercept.T @ y_train
+        )
+        
+        model_params = {
+            'weights': weights,
+            'X_mean': X_mean,
+            'X_std': X_std,
+            'regime': regime
+        }
+        
+        return model_params
+        
+    except:
+        # Fallback to simple momentum weights
+        momentum_weights = np.array([0.1, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0, 0.1])  # Intercept + 8 features
+        return {
+            'weights': momentum_weights,
+            'X_mean': np.zeros(8),
+            'X_std': np.ones(8),
+            'regime': regime
+        }
 
-# Balanced risk management for profitability
-max_holding_period = 12     # Longer holding period for trends
-target_capital_utilization = 0.8  # Target 80% capital utilization
-base_position_size = 0.6   # Larger base position size
-max_position_per_instrument = 0.3  # Max 30% of capital per instrument
-daily_loss_limit = 1000     # Higher daily loss limit
-neutrality_tolerance = 0.1  # More relaxed market neutrality
+def generate_predictions(features, model_params, regime):
+    """Generate return predictions using trained linear model"""
+    if features is None or model_params is None:
+        # Fallback to simple momentum signals
+        if features is not None:
+            momentum_5d = features[:, 1]  # 5-day momentum
+            z_scores = features[:, 4]     # Z-scores
+            predictions = 0.5 * np.tanh(momentum_5d * 5) + 0.5 * np.tanh(-z_scores)
+            confidences = np.minimum(np.abs(predictions) + 0.3, 1.0)
+            return predictions, confidences
+        else:
+            return np.zeros(nInst), np.zeros(nInst)
+    
+    n_inst = features.shape[0]
+    predictions = np.zeros(n_inst)
+    confidences = np.zeros(n_inst)
+    
+    weights = model_params['weights']
+    X_mean = model_params['X_mean']
+    X_std = model_params['X_std']
+    
+    for i in range(n_inst):
+        # Use first 8 features for prediction
+        inst_features = features[i, :8]
+        
+        # Standardize using training statistics
+        inst_features_scaled = (inst_features - X_mean) / X_std
+        
+        # Add intercept and predict
+        features_with_intercept = np.concatenate([[1.0], inst_features_scaled])
+        prediction = np.dot(features_with_intercept, weights)
+        
+        # Scale prediction to reasonable range
+        prediction = np.tanh(prediction * 3)
+        
+        # Confidence based on absolute prediction strength
+        confidence = min(abs(prediction) + 0.2, 1.0)
+        
+        predictions[i] = prediction
+        confidences[i] = confidence
+    
+    # Apply regime-specific adjustments
+    if regime == 'volatile':
+        predictions *= 0.5
+        confidences *= 0.7
+    elif regime in ['trending_up', 'trending_down']:
+        # Boost momentum-aligned signals
+        momentum_5d = features[:, 1]
+        momentum_direction = np.sign(momentum_5d)
+        prediction_direction = np.sign(predictions)
+        
+        # Boost aligned signals
+        alignment = momentum_direction * prediction_direction
+        boost_mask = alignment > 0
+        predictions[boost_mask] *= 1.2
+        confidences[boost_mask] *= 1.1
+    
+    return predictions, confidences
 
-def calculate_simple_momentum(prices, window=lookback_short):
-    """Simple momentum calculation"""
-    if len(prices) < window + 1:
-        return 0.0
-    return (prices[-1] / prices[-window] - 1)
+def filter_signals(predictions, confidences, features, regime):
+    """Apply more relaxed signal filtering to ensure trading"""
+    if features is None:
+        return predictions.copy()
+    
+    n_inst = len(predictions)
+    filtered_signals = predictions.copy()
+    
+    # 1. BASIC CONFIDENCE THRESHOLD - Much more relaxed
+    confidence_threshold = 0.3  # Reduced from 0.6 to 0.3
+    low_confidence_mask = confidences < confidence_threshold
+    filtered_signals[low_confidence_mask] *= 0.5  # Don't zero out, just reduce
+    
+    # 2. SIGNAL STRENGTH THRESHOLD - More relaxed
+    signal_strength_threshold = 0.1  # Reduced from 0.3 to 0.1
+    weak_signal_mask = np.abs(predictions) < signal_strength_threshold
+    filtered_signals[weak_signal_mask] = 0
+    
+    # 3. VOLATILITY FILTER - Less aggressive penalty
+    volatilities = features[:, 6]  # Volatility feature
+    high_vol_threshold = np.percentile(volatilities, 90)  # Only avoid top 10% most volatile
+    high_vol_mask = volatilities > high_vol_threshold
+    filtered_signals[high_vol_mask] *= 0.5  # Reduce instead of near-zero
+    
+    # 4. REGIME-SPECIFIC FILTERS - More permissive
+    if regime == 'mean_reverting':
+        # For mean reversion, allow moderate z-scores
+        z_scores = features[:, 4]  # Z-score feature
+        moderate_z_mask = np.abs(z_scores) < 1.0  # Reduced from 1.5
+        filtered_signals[moderate_z_mask] *= 0.7  # Reduce instead of zero
+        
+    elif regime in ['trending_up', 'trending_down']:
+        # For trending markets, be more permissive with momentum
+        momentum_5d = features[:, 1]
+        momentum_direction = np.sign(momentum_5d)
+        signal_direction = np.sign(filtered_signals)
+        
+        # Reduce (don't eliminate) counter-momentum signals
+        opposite_direction_mask = (momentum_direction * signal_direction) < 0
+        filtered_signals[opposite_direction_mask] *= 0.6
+        
+        # Less strict momentum requirement
+        weak_momentum_mask = np.abs(momentum_5d) < np.percentile(np.abs(momentum_5d), 50)  # Reduced from 70%
+        filtered_signals[weak_momentum_mask] *= 0.8
+    
+    # 5. ENSURE WE HAVE SOME SIGNALS - Keep top 20% of signals
+    signal_quality_scores = np.abs(filtered_signals) * confidences
+    if np.sum(signal_quality_scores > 0) > 0:
+        quality_threshold = np.percentile(signal_quality_scores[signal_quality_scores > 0], 50)  # Reduced from 75%
+        low_quality_mask = signal_quality_scores < quality_threshold
+        filtered_signals[low_quality_mask] *= 0.3  # Reduce instead of eliminate
+    
+    # 6. CROSS-SECTIONAL FILTER - Only apply if we have enough signals
+    if np.sum(np.abs(filtered_signals) > 0) > 10:  # Only if we have >10 non-zero signals
+        if np.std(predictions) > 0:
+            cs_z_scores = (predictions - np.mean(predictions)) / np.std(predictions)
+            moderate_signal_mask = np.abs(cs_z_scores) < 0.7  # Reduced from 1.0
+            filtered_signals[moderate_signal_mask] *= 0.7
+    
+    return filtered_signals
 
-def calculate_simple_mean_reversion(prices, window=lookback_medium):
-    """Simple mean reversion z-score"""
-    if len(prices) < window:
-        return 0.0
+def construct_optimal_portfolio(signals, prices, regime):
+    """Build portfolio with more aggressive position sizing to ensure trading"""
+    n_inst = len(signals)
+    current_prices = prices[:, -1]
     
-    recent_prices = prices[-window:]
-    z_score = (prices[-1] - np.mean(recent_prices)) / (np.std(recent_prices) + 1e-8)
-    return z_score
-
-def calculate_spread_zscore(prices_a, prices_b, lookback=lookback_medium):
-    """Calculate z-score of the spread between two price series"""
-    if len(prices_a) < lookback + 1 or len(prices_b) < lookback + 1:
-        return 0.0, 0.0, 0.0
+    # Less conservative position limits
+    max_dollar_per_instrument = 9000  # Slightly reduced but not too conservative
+    max_positions = np.floor(max_dollar_per_instrument / current_prices).astype(int)
     
-    # Calculate the spread (price ratio for simplicity)
-    spread = prices_a / prices_b
+    # Less aggressive volatility penalty
+    if prices.shape[1] > 10:
+        recent_returns = np.diff(np.log(prices[:, -10:]), axis=1)
+        volatilities = np.std(recent_returns, axis=1)
+        vol_adjustment = 1.0 / (1.0 + 1.5 * volatilities)  # Reduced penalty
+    else:
+        vol_adjustment = np.ones(n_inst)
     
-    if len(spread) < lookback:
-        return 0.0, 0.0, 0.0
+    # Trade more positions (top 10-15 long, 10-15 short)
+    signal_ranks = np.argsort(signals)
     
-    # Calculate rolling statistics
-    recent_spread = spread[-lookback:]
-    mean_spread = np.mean(recent_spread)
-    std_spread = np.std(recent_spread)
+    target_positions = np.zeros(n_inst)
     
-    if std_spread == 0:
-        return 0.0, 0.0, 0.0
+    # Select more performers to ensure trading
+    n_positions = min(15, max(8, n_inst // 4))  # 8-15 positions each side
     
-    current_spread = spread[-1]
-    z_score = (current_spread - mean_spread) / std_spread
+    # Ensure we have enough non-zero signals
+    non_zero_signals = np.sum(np.abs(signals) > 0)
+    if non_zero_signals < 10:
+        # If too few signals, lower the bar
+        signal_threshold = np.percentile(np.abs(signals), 60) if non_zero_signals > 0 else 0
+        boosted_signals = signals.copy()
+        weak_mask = (np.abs(signals) > signal_threshold/2) & (np.abs(signals) <= signal_threshold)
+        boosted_signals[weak_mask] *= 2  # Boost weaker signals
+        signals = boosted_signals
+        
+        # Recompute ranks
+        signal_ranks = np.argsort(signals)
     
-    return z_score, current_spread, mean_spread
-
-def find_best_pairs(prices, min_corr=correlation_min):
-    """Find highly correlated pairs for trading"""
-    n_instruments, n_days = prices.shape
-    pairs = []
+    # Long positions (highest predicted returns)
+    long_candidates = signal_ranks[-n_positions:]
+    for i, idx in enumerate(long_candidates):
+        if signals[idx] > 0:
+            # More aggressive position sizing
+            signal_strength = min(abs(signals[idx]), 2.0)
+            rank_weight = (i + 1) / n_positions
+            
+            base_size = max_positions[idx] * 0.7 * vol_adjustment[idx]  # Less conservative
+            position_size = base_size * max(signal_strength / 2.0, 0.3) * rank_weight  # Minimum 30% sizing
+            target_positions[idx] = max(int(position_size), 1)  # Ensure at least 1 share
     
-    if n_days < correlation_lookback:
-        return pairs
+    # Short positions (lowest predicted returns)
+    short_candidates = signal_ranks[:n_positions]
+    for i, idx in enumerate(short_candidates):
+        if signals[idx] < 0:
+            signal_strength = min(abs(signals[idx]), 2.0)
+            rank_weight = (n_positions - i) / n_positions
+            
+            base_size = max_positions[idx] * 0.7 * vol_adjustment[idx]
+            position_size = base_size * max(signal_strength / 2.0, 0.3) * rank_weight
+            target_positions[idx] = min(-max(int(position_size), 1), -1)  # Ensure at least -1 share
     
-    # Calculate correlations between all pairs (limited to avoid over-trading)
-    for i in range(min(30, n_instruments)):  # Check more instruments
-        for j in range(i + 1, min(30, n_instruments)):
-            corr = calculate_correlation(prices[i, :], prices[j, :])
-            if abs(corr) >= min_corr:
-                pairs.append((i, j, abs(corr)))
+    # Apply position limits
+    target_positions = np.clip(target_positions, -max_positions, max_positions)
     
-    # If no pairs meet the threshold, lower it and try again
-    if len(pairs) == 0:
-        for i in range(min(25, n_instruments)):
-            for j in range(i + 1, min(25, n_instruments)):
-                corr = calculate_correlation(prices[i, :], prices[j, :])
-                if abs(corr) >= 0.3:  # Much lower threshold
-                    pairs.append((i, j, abs(corr)))
+    # Less strict dollar neutrality
+    long_value = np.sum(np.maximum(target_positions, 0) * current_prices)
+    short_value = abs(np.sum(np.minimum(target_positions, 0) * current_prices))
     
-    # Sort by correlation strength and take only best pairs
-    pairs.sort(key=lambda x: x[2], reverse=True)
+    if long_value > 0 and short_value > 0:
+        imbalance = long_value / short_value
+        if imbalance > 1.5:  # More permissive threshold
+            target_positions[target_positions > 0] = (target_positions[target_positions > 0] * 0.85).astype(int)
+        elif imbalance < 0.67:
+            target_positions[target_positions < 0] = (target_positions[target_positions < 0] * 0.85).astype(int)
     
-    # Return top 8 pairs to get reasonable trading
-    return pairs[:8]
-
-def calculate_position_size_conservative(signal_strength, max_shares, volatility=1.0):
-    """Conservative position sizing"""
-    # Much smaller position sizes
-    base_fraction = min(abs(signal_strength) / 4.0, 0.5)  # Cap at 50%
-    position_fraction = base_fraction * base_position_size
-    
-    # Volatility adjustment (reduce size for high volatility)
-    vol_adj = 1.0 / (1.0 + volatility)
-    position_fraction *= vol_adj
-    
-    return position_fraction * max_shares
-
-def calculate_volatility(prices, window=20):
-    """Calculate volatility"""
-    if len(prices) < window + 1:
-        return 0.02
-    
-    returns = np.diff(np.log(prices[-window:]))
-    return np.std(returns) * np.sqrt(252)
-
-def calculate_correlation(prices_a, prices_b, lookback=correlation_lookback):
-    """Calculate rolling correlation between two price series"""
-    actual_lookback = min(len(prices_a), len(prices_b), lookback, 30)  # Use available data, max 30
-    
-    if actual_lookback < 8:  # Minimum 8 data points
-        return 0.0
-    
-    # Calculate returns for correlation
-    returns_a = np.diff(np.log(prices_a[-actual_lookback:]))
-    returns_b = np.diff(np.log(prices_b[-actual_lookback:]))
-    
-    if len(returns_a) < 5:
-        return 0.0
-    
-    correlation = np.corrcoef(returns_a, returns_b)[0, 1]
-    return correlation if not np.isnan(correlation) else 0.0
-
-
-
+    return target_positions
 
 def getMyPosition(prcSoFar):
-    """
-    Simple, Profitable Trading Strategy
-    Focus on high-quality pairs trading with strict risk management
-    """
-    global prev_pos, trade_count, pair_spreads, active_pairs, position_holding_time, recent_pnl
-    
-    # Get dimensions
-    n_instruments, n_days = prcSoFar.shape
-    
-    # Initialize positions
-    positions = np.zeros(n_instruments)
-    
-    # Need sufficient history
-    if n_days < 10:  # Start trading much earlier
-        return positions
-    
-    current_prices = prcSoFar[:, -1]
-    max_shares = max_notional / current_prices
-    
-    # Update position holding time
-    position_holding_time += 1
-    
-    # STRATEGY: Conservative Pairs Trading Only
-    best_pairs = find_best_pairs(prcSoFar)
-    
-    if len(best_pairs) == 0:
-        # If no good pairs, use aggressive momentum on individual instruments
-        for i in range(n_instruments):  # Trade ALL instruments
-            momentum = calculate_simple_momentum(prcSoFar[i, :])
-            mean_revert = calculate_simple_mean_reversion(prcSoFar[i, :])
-            
-            # Much more aggressive entry - trade on any signal
-            signal_strength = 0.0
-            
-            # Momentum component
-            if abs(momentum) > momentum_threshold:
-                signal_strength += momentum
-            
-            # Mean reversion component (smaller weight)
-            if abs(mean_revert) > mean_revert_threshold:
-                signal_strength += -mean_revert * 0.2
-            
-            # Enter position if any signal
-            if abs(signal_strength) > 0.005:  # Very low threshold
-                volatility = calculate_volatility(prcSoFar[i, :])
-                pos_size = signal_strength * base_position_size * max_shares[i]
-                # Volatility adjustment
-                vol_adj = 1.0 / (1.0 + volatility)
-                positions[i] = pos_size * vol_adj
-        
-        # Apply conservative limits
-        positions = np.clip(positions, -max_shares * max_position_per_instrument, 
-                          max_shares * max_position_per_instrument)
-    else:
-        # Pairs trading - only trade the best 3 pairs to avoid over-trading
-        for i, j, correlation in best_pairs[:3]:
-            pair_key = f"{min(i, j)}_{max(i, j)}"
-            
-            # Calculate spread z-score
-            z_score, current_spread, mean_spread = calculate_spread_zscore(prcSoFar[i, :], prcSoFar[j, :])
-            
-            # Store spread history
-            if pair_key not in pair_spreads:
-                pair_spreads[pair_key] = []
-            pair_spreads[pair_key].append(current_spread)
-            
-            # Current positions
-            current_pos_i = prev_pos[i] if len(prev_pos) > i else 0
-            current_pos_j = prev_pos[j] if len(prev_pos) > j else 0
-            
-            # Exit logic - be more conservative about exits
-            should_exit = False
-            if (current_pos_i != 0 or current_pos_j != 0):
-                if (abs(z_score) <= pairs_z_exit or 
-                    position_holding_time[i] >= max_holding_period or 
-                    position_holding_time[j] >= max_holding_period):
-                    should_exit = True
-            
-            if should_exit:
-                positions[i] = 0
-                positions[j] = 0
-                position_holding_time[i] = 0
-                position_holding_time[j] = 0
-                if pair_key in active_pairs:
-                    active_pairs.remove(pair_key)
-                continue
-            
-            # Entry logic - only enter with very strong signals
-            if abs(z_score) >= pairs_z_entry and current_pos_i == 0 and current_pos_j == 0:
-                # Calculate volatilities for risk adjustment
-                vol_i = calculate_volatility(prcSoFar[i, :])
-                vol_j = calculate_volatility(prcSoFar[j, :])
-                
-                # Conservative position sizing
-                signal_strength = min(abs(z_score) / 3.0, 0.5)  # Cap signal strength
-                pos_size_i = signal_strength * base_position_size * max_shares[i] / (vol_i + 0.01)
-                pos_size_j = signal_strength * base_position_size * max_shares[j] / (vol_j + 0.01)
-                
-                # Determine direction
-                if z_score > 0:  # i is expensive relative to j
-                    positions[i] = -pos_size_i * 0.5  # Conservative sizing
-                    positions[j] = pos_size_j * 0.5
-                else:  # i is cheap relative to j
-                    positions[i] = pos_size_i * 0.5
-                    positions[j] = -pos_size_j * 0.5
-                
-                active_pairs.add(pair_key)
-                position_holding_time[i] = 0
-                position_holding_time[j] = 0
-            
-            # Maintain existing positions
-            elif current_pos_i != 0 or current_pos_j != 0:
-                positions[i] = current_pos_i
-                positions[j] = current_pos_j
-    
-    # Final fallback: If still no positions, ensure some minimal trading
-    if np.sum(np.abs(positions)) == 0:
-        # Simple momentum strategy on select instruments
-        for i in range(0, min(20, n_instruments), 4):  # Every 4th instrument up to 20
-            if len(prcSoFar[i, :]) >= lookback_short:
-                momentum = calculate_simple_momentum(prcSoFar[i, :], lookback_short)
-                if abs(momentum) > 0.01:  # Very low threshold (1%)
-                    pos_size = momentum * base_position_size * 0.3 * max_shares[i]
-                    positions[i] = pos_size
-    
-    # Apply position limits per instrument
-    max_position_limit = max_shares * max_position_per_instrument
-    positions = np.clip(positions, -max_position_limit, max_position_limit)
-    
-    # AGGRESSIVE CAPITAL UTILIZATION
-    position_notional = np.abs(positions) * current_prices
-    total_position_notional = np.sum(position_notional)
-    current_utilization = total_position_notional / total_capital
-    
-    # If utilization is too low, scale up aggressively
-    if current_utilization < target_capital_utilization * 0.6:
-        if current_utilization > 0:
-            scale_factor = min(target_capital_utilization / current_utilization, 2.5)
-            positions = positions * scale_factor
-        else:
-            # If no positions at all, create basic momentum positions
-            for i in range(0, n_instruments, 2):  # Every other instrument
-                if len(prcSoFar[i, :]) >= 10:
-                    momentum = calculate_simple_momentum(prcSoFar[i, :])
-                    if abs(momentum) > 0.005:  # Very low threshold
-                        pos_size = momentum * base_position_size * max_shares[i] * 0.5
-                        positions[i] = pos_size
-        
-        # Re-apply limits after scaling
-        positions = np.clip(positions, -max_position_limit, max_position_limit)
-    
-    # Relaxed market neutrality for higher returns
-    positions = ensure_market_neutrality_relaxed(positions, current_prices)
-    
-    # Less smoothing for more responsive trading
-    if trade_count > 0:
-        alpha = 0.7  # More responsive (70% new, 30% old)
-        smoothed_positions = alpha * positions + (1 - alpha) * prev_pos[:len(positions)]
-    else:
-        smoothed_positions = positions
-    
-    # Round and finalize
-    final_positions = np.round(smoothed_positions)
-    
-    # Final risk check - ensure no position is too large
-    max_abs_position = np.max(np.abs(final_positions * current_prices))
-    if max_abs_position > max_notional * max_position_per_instrument:
-        scale_down = (max_notional * max_position_per_instrument) / max_abs_position
-        final_positions = final_positions * scale_down
-    
-    # Update tracking
-    trade_count += 1
-    prev_pos = final_positions.copy()
-    
-    return final_positions
+    global currentPos, signal_history
 
-def ensure_market_neutrality_relaxed(positions, current_prices):
-    """Relaxed market neutrality to allow net exposure for profits"""
-    long_exposure = np.sum(np.maximum(positions * current_prices, 0))
-    short_exposure = np.sum(np.minimum(positions * current_prices, 0))
-    total_exposure = long_exposure + abs(short_exposure)
-    
-    if total_exposure == 0:
-        return positions
-    
-    net_exposure = (long_exposure + short_exposure) / total_exposure
-    
-    # Allow significant net exposure for profit opportunities
-    if abs(net_exposure) > neutrality_tolerance:
-        adjustment_factor = 1.0 - (abs(net_exposure) - neutrality_tolerance) * 0.3  # Gentle adjustment
-        
-        if net_exposure > 0:
-            positions = np.where(positions > 0, positions * adjustment_factor, positions)
-        else:
-            positions = np.where(positions < 0, positions * adjustment_factor, positions)
-    
-    return positions
+    n_inst, n_days = prcSoFar.shape
+    if n_days < 25:
+        return np.zeros(n_inst)
 
+    # === 1. Feature Engineering ===
+    log_prices = np.log(np.maximum(prcSoFar, 1e-8))
+    returns = np.diff(log_prices, axis=1)
+    features = []
+    for i in range(n_inst):
+        inst_returns = returns[i, :]
+        mom_1d = inst_returns[-1]
+        mom_5d = np.sum(inst_returns[-5:])
+        z_10 = (inst_returns[-1] - np.mean(inst_returns[-10:])) / (np.std(inst_returns[-10:]) + 1e-8)
+        z_20 = (inst_returns[-1] - np.mean(inst_returns[-20:])) / (np.std(inst_returns[-20:]) + 1e-8)
+        vol_10 = np.std(inst_returns[-10:])
+        # PCA residual (first PC removed)
+        if n_days > 20:
+            X = returns[:, -20:]
+            X = X - X.mean(axis=1, keepdims=True)
+            u, s, vh = np.linalg.svd(X, full_matrices=False)
+            pc1 = np.outer(u[:, 0], s[0] * vh[0])
+            pca_resid = inst_returns[-1] - pc1[i, -1]
+        else:
+            pca_resid = 0
+        features.append([mom_1d, mom_5d, z_10, vol_10, pca_resid])
+    features = np.array(features)
+
+    # === 2. Regime Detection ===
+    market_ret_10 = np.mean(np.mean(returns[:, -10:], axis=0))
+    trending = abs(market_ret_10) > 0.002
+
+    # === 3. Signal Boosting (Momentum + Mean-Reversion + Volatility Penalty) ===
+    # Short-term momentum: mom_1d, mom_5d
+    # Medium-term reversion: z_10
+    # Volatility: vol_10
+    # PCA residual: pca_resid
+    # Penalize top 20% volatility
+    vol_10 = features[:, 3]
+    vol_thresh = np.percentile(vol_10, 80)
+    vol_penalty = np.where(vol_10 > vol_thresh, 0.5, 1.0) * (1 / (1 + vol_10))
+
+    # === 4. Simple Linear Model/Threshold Classifier ===
+    # We'll use a simple linear model with hand-tuned weights
+    # [Return-1d, Return-5d, Z-score, Volatility, PCA Residual]
+    weights = np.array([0.6, 0.4, -0.5, -0.2, 0.2])
+    # Regime switching: use momentum in trending, mean-reversion otherwise
+    if trending:
+        # Momentum regime: upweight momentum, downweight reversion
+        weights = np.array([0.8, 0.7, -0.2, -0.2, 0.1])
+    else:
+        # Mean-reversion regime: upweight reversion, downweight momentum
+        weights = np.array([0.2, 0.1, -0.7, -0.2, 0.3])
+
+    # Linear model prediction
+    model_signal = features @ weights
+    # Model confidence: sigmoid of abs(model_signal)
+    model_confidence = 1 / (1 + np.exp(-2 * np.abs(model_signal)))
+
+    # Only take positions if confidence > 0.55 or abs(pred) > 0.002
+    valid_mask = (model_confidence > 0.55) | (np.abs(model_signal) > 0.002)
+    filtered_signal = np.where(valid_mask, model_signal, 0.0)
+
+    # Apply volatility penalty
+    combined_signal = filtered_signal * vol_penalty
+
+    # === 5. Entry/Exit Logic ===
+    std_signal = np.std(combined_signal)
+    entry_thresh = 1.5 * std_signal
+    exit_thresh = 0.5 * std_signal
+
+    positions = np.zeros(n_inst)
+    # Only trade top 5 long and 5 short instruments
+    ranked = np.argsort(combined_signal)
+    longs = ranked[-5:]
+    shorts = ranked[:5]
+
+    max_pos = np.floor(10000 / prcSoFar[:, -1]).astype(int)
+    for idx in longs:
+        if combined_signal[idx] > entry_thresh:
+            # Volatility-adjusted sizing
+            size = max_pos[idx] * (1 / (1 + vol_10[idx]))
+            positions[idx] = int(size * min(1, abs(combined_signal[idx]) / (2 * entry_thresh)))
+        elif abs(combined_signal[idx]) < exit_thresh:
+            positions[idx] = 0
+
+    for idx in shorts:
+        if combined_signal[idx] < -entry_thresh:
+            size = max_pos[idx] * (1 / (1 + vol_10[idx]))
+            positions[idx] = -int(size * min(1, abs(combined_signal[idx]) / (2 * entry_thresh)))
+        elif abs(combined_signal[idx]) < exit_thresh:
+            positions[idx] = 0
+
+    # Smoothing to reduce turnover
+    if len(signal_history) == n_inst:
+        alpha = 0.5
+        # Ensure signal_history is a numpy array for arithmetic
+        positions = alpha * positions + (1 - alpha) * np.array(signal_history)
+    signal_history[:] = positions
+
+    currentPos = positions.astype(int)
+    return currentPos
